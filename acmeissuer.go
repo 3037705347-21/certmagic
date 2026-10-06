@@ -529,7 +529,10 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 		return nil, usingTestCA, fmt.Errorf("no certificate chains")
 	}
 
-	preferredChain := am.selectPreferredChain(certChains)
+	preferredChain, err := am.selectPreferredChain(ctx, certChains)
+	if err != nil {
+		return nil, usingTestCA, err
+	}
 
 	ic := &IssuedCertificate{
 		Certificate: preferredChain.ChainPEM,
@@ -541,20 +544,52 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 	return ic, usingTestCA, nil
 }
 
+// chainSelectionStrict reports whether chain selection must fail instead of
+// falling back to an arbitrary chain when no offered chain matches the
+// configured preferences. It is enabled on the issuer itself (Strict) or by
+// the caller for the duration of a context, which is how chain reconciliation
+// requests a hard failure without mutating the shared issuer configuration.
+func (am *ACMEIssuer) chainSelectionStrict(ctx context.Context) bool {
+	if am.PreferredChains.Strict {
+		return true
+	}
+	strict, _ := ctx.Value(ctxKeyRequirePreferredChain).(bool)
+	return strict
+}
+
 // selectPreferredChain sorts and then filters the certificate chains to find the optimal
-// chain preferred by the client. If there's only one chain, that is returned without any
-// processing. If there are no matches, the first chain is returned.
-func (am *ACMEIssuer) selectPreferredChain(certChains []acme.Certificate) acme.Certificate {
+// chain preferred by the client. If there's only one chain, that one is returned without
+// any sorting. If none of the chains match the configured common name preferences, the
+// first chain is returned, unless strict selection is enabled (PreferredChains.Strict or
+// the context carries ctxKeyRequirePreferredChain), in which case ErrNoMatchingChain is
+// returned instead of silently picking an arbitrary chain.
+func (am *ACMEIssuer) selectPreferredChain(ctx context.Context, certChains []acme.Certificate) (acme.Certificate, error) {
+	strict := am.chainSelectionStrict(ctx)
+	pref := am.PreferredChains
+
 	if len(certChains) == 1 {
-		if len(am.PreferredChains.AnyCommonName) > 0 || len(am.PreferredChains.RootCommonName) > 0 {
-			am.Logger.Debug("there is only one chain offered; selecting it regardless of preferences",
-				zap.String("chain_url", certChains[0].URL))
+		if !chainPreferenceHasCN(pref) {
+			return certChains[0], nil
 		}
-		return certChains[0]
+		am.Logger.Debug("there is only one chain offered; checking it against preferences",
+			zap.String("chain_url", certChains[0].URL))
+		chain, err := parseCertsFromPEMBundle(certChains[0].ChainPEM)
+		if err == nil && chainMatchesPreference(chain, pref) {
+			return certChains[0], nil
+		}
+		if err != nil {
+			am.Logger.Error("unable to parse the only PEM certificate chain offered",
+				zap.String("chain_url", certChains[0].URL),
+				zap.Error(err))
+		}
+		if !strict {
+			return certChains[0], nil
+		}
+		return acme.Certificate{}, am.noMatchingChainErr(certChains)
 	}
 
-	if am.PreferredChains.Smallest != nil {
-		if *am.PreferredChains.Smallest {
+	if pref.Smallest != nil {
+		if *pref.Smallest {
 			sort.Slice(certChains, func(i, j int) bool {
 				return len(certChains[i].ChainPEM) < len(certChains[j].ChainPEM)
 			})
@@ -565,7 +600,7 @@ func (am *ACMEIssuer) selectPreferredChain(certChains []acme.Certificate) acme.C
 		}
 	}
 
-	if len(am.PreferredChains.AnyCommonName) > 0 || len(am.PreferredChains.RootCommonName) > 0 {
+	if chainPreferenceHasCN(pref) {
 		// in order to inspect, we need to decode their PEM contents
 		decodedChains := make([][]*x509.Certificate, len(certChains))
 		for i, chain := range certChains {
@@ -579,38 +614,38 @@ func (am *ACMEIssuer) selectPreferredChain(certChains []acme.Certificate) acme.C
 			decodedChains[i] = certs
 		}
 
-		if len(am.PreferredChains.AnyCommonName) > 0 {
-			for _, prefAnyCN := range am.PreferredChains.AnyCommonName {
-				for i, chain := range decodedChains {
-					for _, cert := range chain {
-						if cert.Issuer.CommonName == prefAnyCN {
-							am.Logger.Debug("found preferred certificate chain by issuer common name",
-								zap.String("preference", prefAnyCN),
-								zap.Int("chain", i))
-							return certChains[i]
-						}
-					}
-				}
+		// chains are already in preference order (their offered order,
+		// or smallest/largest order); take the first one that matches
+		for i, chain := range decodedChains {
+			if chainMatchesPreference(chain, pref) {
+				am.Logger.Debug("found preferred certificate chain",
+					zap.Int("chain", i),
+					zap.String("chain_url", certChains[i].URL),
+					zap.Strings("preferred_root_common_names", pref.RootCommonName),
+					zap.Strings("preferred_any_common_names", pref.AnyCommonName))
+				return certChains[i], nil
 			}
 		}
 
-		if len(am.PreferredChains.RootCommonName) > 0 {
-			for _, prefRootCN := range am.PreferredChains.RootCommonName {
-				for i, chain := range decodedChains {
-					if chain[len(chain)-1].Issuer.CommonName == prefRootCN {
-						am.Logger.Debug("found preferred certificate chain by root common name",
-							zap.String("preference", prefRootCN),
-							zap.Int("chain", i))
-						return certChains[i]
-					}
-				}
-			}
+		if !strict {
+			am.Logger.Warn("did not find chain matching preferences; using first")
+			return certChains[0], nil
 		}
-
-		am.Logger.Warn("did not find chain matching preferences; using first")
+		return acme.Certificate{}, am.noMatchingChainErr(certChains)
 	}
 
-	return certChains[0]
+	return certChains[0], nil
+}
+
+// noMatchingChainErr builds an ErrNoMatchingChain error describing what the
+// CA offered and what the issuer was configured to require.
+func (am *ACMEIssuer) noMatchingChainErr(offered []acme.Certificate) error {
+	offeredURLs := make([]string, 0, len(offered))
+	for _, chain := range offered {
+		offeredURLs = append(offeredURLs, chain.URL)
+	}
+	return fmt.Errorf("%w: none of the %d chain(s) offered by the CA match the configured preferred chains (root common names: %v, any issuer common names: %v); offered: %v",
+		ErrNoMatchingChain, len(offered), am.PreferredChains.RootCommonName, am.PreferredChains.AnyCommonName, offeredURLs)
 }
 
 // Revoke implements the Revoker interface. It revokes the given certificate.
@@ -642,7 +677,41 @@ type ChainPreference struct {
 	// Select first chain that has any issuer with one
 	// of these common names.
 	AnyCommonName []string
+
+	// Require that one of the chains offered by the CA satisfy the
+	// RootCommonName/AnyCommonName preferences above. If none do,
+	// issuance fails with ErrNoMatchingChain instead of silently
+	// falling back to the first offered chain. This is essential
+	// when migrating certificates between alternate chains (for
+	// example, from a cross-signed chain to a root chain): it makes
+	// a CA that temporarily does not offer the preferred chain a
+	// hard, visible failure rather than quietly pinning the
+	// certificate to the wrong chain.
+	//
+	// Chain reconciliation (Config.ReconcileCertificateChains)
+	// enforces strict selection for the duration of its renewals
+	// regardless of this field.
+	Strict bool
 }
+
+// CertChainPreference exposes the issuer's chain preferences to code
+// that reconciles stored certificates against them without depending on
+// the concrete ACME issuer type.
+func (am *ACMEIssuer) CertChainPreference() ChainPreference {
+	return am.PreferredChains
+}
+
+// ChainPreferenceProvider is implemented by Issuers that express a
+// preference among alternate certificate chains. It is optional; issuers
+// that do not implement it are skipped by chain reconciliation.
+type ChainPreferenceProvider interface {
+	CertChainPreference() ChainPreference
+}
+
+// ErrNoMatchingChain is returned by an Issuer with strict chain
+// preferences (see ChainPreference.Strict) when none of the certificate
+// chains offered by the CA match those preferences.
+var ErrNoMatchingChain = errors.New("no certificate chain offered by the CA matches the configured preferences")
 
 // DefaultACME specifies default settings to use for ACMEIssuers.
 // Using this value is optional but can be convenient.
@@ -672,7 +741,15 @@ const prefixACME = "acme"
 
 type ctxKey string
 
-const ctxKeyARIReplaces = ctxKey("ari_replaces")
+const (
+	ctxKeyARIReplaces = ctxKey("ari_replaces")
+
+	// ctxKeyRequirePreferredChain, when set to true on an Issue context,
+	// makes chain selection strict for that issuance even if the issuer's
+	// PreferredChains.Strict is not set. Used internally by chain
+	// reconciliation.
+	ctxKeyRequirePreferredChain = ctxKey("require_preferred_chain")
+)
 
 // Interface guards
 var (
