@@ -416,6 +416,18 @@ func (am *ACMEIssuer) Issue(ctx context.Context, csr *x509.CertificateRequest) (
 		// other endpoint. This is more likely to happen if a user is testing with
 		// the staging CA as the main CA, then changes their configuration once they
 		// think they are ready for the production endpoint.
+		//
+		// The test-CA certificate is discarded and its assets are never stored,
+		// so conclusively close the test-CA issuance transaction now: this drops
+		// the persisted in-flight order record for the test CA so a later staging
+		// attempt does not resume (and re-download) an order whose certificate we
+		// never keep.
+		if cert.onComplete != nil {
+			if cleanupErr := cert.onComplete(context.WithoutCancel(ctx)); cleanupErr != nil {
+				am.Logger.Warn("failed removing in-flight order record for discarded test-CA certificate",
+					zap.Error(cleanupErr))
+			}
+		}
 		cert, _, err = am.doIssue(ctx, csr, 0)
 		if err != nil {
 			// succeeded with test CA but failed just now with the production CA;
@@ -490,12 +502,16 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 
 	// do this in a loop because there's an error case that may necessitate a retry, but not more than once
 	var certChains []acme.Certificate
+	var orderRec *pendingOrderRecord
 	for range 2 {
 		am.Logger.Info("using ACME account",
 			zap.String("account_id", params.Account.Location),
 			zap.Strings("account_contact", params.Account.Contact))
 
-		certChains, err = client.acmeClient.ObtainCertificate(ctx, params)
+		// the resumable flow persists the in-flight order's identity and resumes
+		// that same order after a restart (or on another instance sharing
+		// storage) instead of placing a duplicate order with the CA
+		certChains, orderRec, err = client.obtainCertificate(ctx, params)
 		if err != nil {
 			var prob acme.Problem
 			if errors.As(err, &prob) && prob.Type == acme.ProblemTypeAccountDoesNotExist {
@@ -514,12 +530,31 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 					return nil, usingTestCA, fmt.Errorf("%v ACME account no longer exists on CA, but resetting our local copy of the account info failed: %v", nameSet, err)
 				}
 
+				// orders are account-scoped: every order placed under the now-vanished
+				// account is permanently unreachable, so discard their persisted records
+				// too; otherwise every subsequent issuance would hard-fail on an account
+				// identity that can never come back, instead of placing fresh orders once
+				// the new account exists
+				if purgeErr := am.deleteAllPendingOrders(ctx, client.acmeClient.Directory); purgeErr != nil {
+					am.Logger.Warn("failed purging in-flight ACME order records for vanished account",
+						zap.String("ca", client.acmeClient.Directory),
+						zap.Error(purgeErr))
+				}
+				orderRec = nil
+
 				// recreate account and try again
 				client, err = am.newACMEClientWithAccount(ctx, useTestCA, false)
 				if err != nil {
 					return nil, false, err
 				}
 				continue
+			}
+			// an identity mismatch or an unreadable in-flight order record cannot be
+			// repaired by retrying the same request, and must never be papered over by
+			// placing a new order on top of the ambiguous record; fail explicitly with
+			// no certificate assets written
+			if errors.Is(err, errOrderIdentityMismatch) || errors.Is(err, errCorruptOrderLedger) {
+				return nil, usingTestCA, ErrNoRetry{fmt.Errorf("%v %w (ca=%s)", nameSet, err, client.acmeClient.Directory)}
 			}
 			return nil, usingTestCA, fmt.Errorf("%v %w (ca=%s)", nameSet, err, client.acmeClient.Directory)
 		}
@@ -531,9 +566,16 @@ func (am *ACMEIssuer) doIssue(ctx context.Context, csr *x509.CertificateRequest,
 
 	preferredChain := am.selectPreferredChain(certChains)
 
+	ledgerKey := am.pendingOrderStorageKey(client.acmeClient.Directory, params.Identifiers)
 	ic := &IssuedCertificate{
 		Certificate: preferredChain.ChainPEM,
 		Metadata:    preferredChain,
+		onComplete: func(cleanupCtx context.Context) error {
+			if orderRec == nil {
+				return nil
+			}
+			return am.deletePendingOrderRecord(cleanupCtx, ledgerKey)
+		},
 	}
 
 	am.Logger.Debug("selected certificate chain", zap.String("url", preferredChain.URL))

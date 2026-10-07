@@ -393,6 +393,19 @@ type IssuedCertificate struct {
 	// certificate in storage. It MUST be serializable
 	// as JSON in order to be preserved.
 	Metadata any
+
+	// onComplete, when non-nil, is invoked by the certificate management
+	// layer once issuance is conclusively finished: after the certificate
+	// assets have been committed to storage, or when the issued result is
+	// knowingly discarded (for example, a certificate obtained from the
+	// test CA before retrying the production CA). It is never invoked on
+	// failed issuance. Issuer implementations use it to release resources
+	// tied to the issuance transaction, such as the persisted record of an
+	// in-flight ACME order. A failure is logged but does not undo a
+	// successful issuance: the resource is allowed to self-heal on a later
+	// run. This field is unexported because only this package's issuers and
+	// management layer participate in the contract.
+	onComplete func(context.Context) error
 }
 
 // CertificateResource associates a certificate with its private

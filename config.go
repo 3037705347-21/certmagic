@@ -797,6 +797,20 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 			return fmt.Errorf("[%s] Obtain: saving assets: %v", name, err)
 		}
 
+		// certificate assets are now the committed, single source of truth, so
+		// conclusively close issuance (e.g. drop the persisted in-flight ACME
+		// order record); a failure here only leaves a self-healing record behind,
+		// it must not turn a successful issuance into a failure. Detach from the
+		// request context so a shutdown arriving right after the commit still
+		// gets to clear the record (same rationale as releasing the issue lock).
+		if issuedCert.onComplete != nil {
+			if cleanupErr := issuedCert.onComplete(context.WithoutCancel(ctx)); cleanupErr != nil {
+				log.Warn("issuance completed, but post-issuance cleanup failed",
+					zap.String("identifier", name),
+					zap.Error(cleanupErr))
+			}
+		}
+
 		log.Info("certificate obtained successfully",
 			zap.String("identifier", name),
 			zap.String("issuer", issuerUsed.IssuerKey()))
@@ -1122,6 +1136,15 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, retry, int
 		err = cfg.saveCertResource(ctx, issuerUsed, newCertRes)
 		if err != nil {
 			return fmt.Errorf("[%s] Renew: saving assets: %v", name, err)
+		}
+
+		// renewed assets are committed; release any in-flight order record
+		if issuedCert.onComplete != nil {
+			if cleanupErr := issuedCert.onComplete(context.WithoutCancel(ctx)); cleanupErr != nil {
+				log.Warn("renewal completed, but post-issuance cleanup failed",
+					zap.String("identifier", name),
+					zap.Error(cleanupErr))
+			}
 		}
 
 		log.Info("certificate renewed successfully",
