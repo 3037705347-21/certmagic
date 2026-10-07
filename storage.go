@@ -253,6 +253,29 @@ func (keys KeyBuilder) SiteMeta(issuerKey, domain string) string {
 	return path.Join(keys.CertsSitePrefix(issuerKey, domain), safeDomain+".json")
 }
 
+// MirrorPlansPrefix returns the storage key prefix under which the
+// storage mirror plan ledger keeps its records and append-only event
+// journal.
+func (keys KeyBuilder) MirrorPlansPrefix() string {
+	return prefixMirrorPlans
+}
+
+// MirrorPlanRecord returns the storage key of the current state of
+// the mirror plan with the given ID. The ledger also keeps an
+// append-only event journal (see MirrorPlanEvent); the record is
+// only a convenience copy of the plan's latest state.
+func (keys KeyBuilder) MirrorPlanRecord(id string) string {
+	return path.Join(prefixMirrorPlans, "records", keys.Safe(id)+".json")
+}
+
+// MirrorPlanEvent returns the storage key of the immutable journal
+// event with the given cluster-monotonic sequence number. Sequence
+// numbers are zero-padded so that lexical key order is the same as
+// sequence order on every Storage implementation.
+func (keys KeyBuilder) MirrorPlanEvent(seq int64) string {
+	return path.Join(prefixMirrorPlans, "events", fmt.Sprintf("%020d.json", seq))
+}
+
 // OCSPStaple returns a key for the OCSP staple associated
 // with the given certificate. If you have the PEM bundle
 // handy, pass that in to save an extra encoding step.
@@ -359,6 +382,8 @@ var StorageKeys KeyBuilder
 const (
 	prefixCerts = "certificates"
 	prefixOCSP  = "ocsp"
+
+	prefixMirrorPlans = "mirror-plans"
 )
 
 // safeKeyRE matches any undesirable characters in storage keys.
