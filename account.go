@@ -72,7 +72,20 @@ func (am *ACMEIssuer) loadOrCreateAccount(ctx context.Context, ca, email string)
 }
 
 // loadAccount loads an account from storage, but does not create a new one.
+// If account key rotation is configured, any persisted rotation state is
+// applied (e.g. an interrupted rotation may promote the confirmed new key
+// before the canonical files have been rewritten).
 func (am *ACMEIssuer) loadAccount(ctx context.Context, ca, email string) (acme.Account, error) {
+	acct, err := am.loadCanonicalAccount(ctx, ca, email)
+	if err != nil {
+		return acct, err
+	}
+	return am.applyAccountKeyRotationState(ctx, ca, email, acct)
+}
+
+// loadCanonicalAccount loads the account from its canonical registration
+// and private key files, without applying rotation state.
+func (am *ACMEIssuer) loadCanonicalAccount(ctx context.Context, ca, email string) (acme.Account, error) {
 	regBytes, err := am.config.Storage.Load(ctx, am.storageKeyUserReg(ca, email))
 	if err != nil {
 		return acme.Account{}, err
@@ -210,13 +223,25 @@ func (am *ACMEIssuer) saveAccount(ctx context.Context, ca string, account acme.A
 }
 
 // deleteAccountLocally deletes the registration info and private key of the account
-// for the given CA from storage.
+// for the given CA from storage, along with any in-progress key rotation state.
 func (am *ACMEIssuer) deleteAccountLocally(ctx context.Context, ca string, account acme.Account) error {
 	primaryContact := getPrimaryContact(account)
 	if err := am.config.Storage.Delete(ctx, am.storageKeyUserReg(ca, primaryContact)); err != nil {
 		return err
 	}
-	return am.config.Storage.Delete(ctx, am.storageKeyUserPrivateKey(ca, primaryContact))
+	if err := am.config.Storage.Delete(ctx, am.storageKeyUserPrivateKey(ca, primaryContact)); err != nil {
+		return err
+	}
+	// best-effort: rotation state is part of the account being removed;
+	// Delete is idempotent for missing keys, and a failure here must not
+	// block the removal of the canonical registration and key
+	if err := am.config.Storage.Delete(ctx, am.storageKeyUserKeyRotation(ca, primaryContact)); err != nil {
+		am.Logger.Warn("could not remove account key rotation state while deleting account locally",
+			zap.String("ca", ca),
+			zap.String("contact", primaryContact),
+			zap.Error(err))
+	}
+	return nil
 }
 
 // setEmail does everything it can to obtain an email address

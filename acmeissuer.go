@@ -67,6 +67,15 @@ type ACMEIssuer struct {
 	// subscriber agreement
 	Agreed bool
 
+	// AccountKeyRotation optionally enables windowed rotation of this
+	// ACME account's private key; a new key is confirmed with the CA
+	// before being promoted to the current key, and the previous key is
+	// retained in storage for the configured window. If nil, account
+	// keys are never rotated and account handling is unchanged. Trigger
+	// a rotation with RotateAccountKey(). Rotation cannot be used with a
+	// pinned AccountKeyPEM.
+	AccountKeyRotation *AccountKeyRotation
+
 	// An optional external account to associate
 	// with this ACME account
 	ExternalAccount *acme.EAB
@@ -206,6 +215,9 @@ func NewACMEIssuer(cfg *Config, template ACMEIssuer) *ACMEIssuer {
 	}
 	if !template.Agreed {
 		template.Agreed = DefaultACME.Agreed
+	}
+	if template.AccountKeyRotation == nil {
+		template.AccountKeyRotation = DefaultACME.AccountKeyRotation
 	}
 	if template.ExternalAccount == nil {
 		template.ExternalAccount = DefaultACME.ExternalAccount
