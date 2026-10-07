@@ -16,6 +16,7 @@ package certmagic
 
 import (
 	"fmt"
+	"math/big"
 	weakrand "math/rand/v2"
 	"strings"
 	"sync"
@@ -328,6 +329,29 @@ func (certCache *Cache) replaceCertificate(oldCert, newCert Certificate) {
 	certCache.logger.Info("replaced certificate in cache",
 		zap.Strings("subjects", newCert.Names),
 		zap.Time("new_expiration", expiresAt(newCert.Leaf)))
+}
+
+// evictCertificatesBySerial removes every certificate in the cache
+// whose leaf certificate has the given serial number. A revoked
+// certificate must not remain in memory: a cached copy, including its
+// possibly still-"Good" stapled OCSP response, would keep being served
+// (and re-stapled by maintenance) even after the certificate and its
+// OCSP staple were deleted from storage.
+//
+// This method is safe for concurrent use.
+func (certCache *Cache) evictCertificatesBySerial(serial *big.Int) {
+	certCache.mu.Lock()
+	defer certCache.mu.Unlock()
+
+	var doomed []Certificate
+	for _, cert := range certCache.cache {
+		if cert.Leaf != nil && cert.Leaf.SerialNumber.Cmp(serial) == 0 {
+			doomed = append(doomed, cert)
+		}
+	}
+	for _, cert := range doomed {
+		certCache.removeCertificate(cert)
+	}
 }
 
 // getAllMatchingCerts returns all certificates with exactly this subject

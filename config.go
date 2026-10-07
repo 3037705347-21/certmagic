@@ -1211,8 +1211,21 @@ func (cfg *Config) generateCSR(privateKey crypto.PrivateKey, sans []string, useC
 // that cfg.Issuers is properly configured with the same issuer that issued the
 // certificate being revoked. See RFC 5280 §5.3.1 for reason codes.
 //
-// The certificate assets are deleted from storage after successful revocation
-// to prevent reuse.
+// Revocation is a durable, reconcilable operation: the intent is recorded in
+// storage before the CA is contacted and the result is recorded afterward, so
+// a process restart mid-revocation does not leave the certificate only
+// partially revoked; any unfinished revocation is resumed by background
+// maintenance. A certificate the CA reports as already revoked counts as
+// success.
+//
+// After the revocation is confirmed, the certificate's OCSP staple and site
+// assets are deleted from storage (and any LocalCache), and in-memory copies
+// of the certificate are evicted so the revoked certificate and its staple
+// cannot keep being served.
+//
+// Revoking the same certificate again is not an error and does not create a
+// duplicate record, whether the repeat comes in before or after the site
+// assets are gone.
 func (cfg *Config) RevokeCert(ctx context.Context, domain string, reason int, interactive bool) error {
 	for i, issuer := range cfg.Issuers {
 		issuerKey := issuer.IssuerKey()
@@ -1224,6 +1237,22 @@ func (cfg *Config) RevokeCert(ctx context.Context, domain string, reason int, in
 
 		certRes, err := cfg.loadCertResource(ctx, issuer, domain, cfg.groundTruthStorage())
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// The site assets are already gone, but the ledger may still
+				// know this certificate: resuming its record either finishes
+				// an interrupted revocation or reports success for one that
+				// already completed, instead of erroring on the repeat.
+				rec, findErr := cfg.findRevocationRecordForDomain(ctx, issuerKey, domain)
+				if findErr != nil {
+					return findErr
+				}
+				if rec != nil {
+					if err := cfg.processRevocationRecord(ctx, *rec); err != nil {
+						return fmt.Errorf("issuer %d (%s): %v", i, issuerKey, err)
+					}
+					continue
+				}
+			}
 			return err
 		}
 
@@ -1231,14 +1260,8 @@ func (cfg *Config) RevokeCert(ctx context.Context, domain string, reason int, in
 			return fmt.Errorf("private key not found for %s", certRes.SANs)
 		}
 
-		err = rev.Revoke(ctx, certRes, reason)
-		if err != nil {
+		if err := cfg.revokeWithLedger(ctx, rev, issuerKey, certRes, reason); err != nil {
 			return fmt.Errorf("issuer %d (%s): %v", i, issuerKey, err)
-		}
-
-		err = cfg.deleteSiteAssets(ctx, issuerKey, domain)
-		if err != nil {
-			return fmt.Errorf("certificate revoked, but unable to fully clean up assets from issuer %s: %v", issuerKey, err)
 		}
 	}
 

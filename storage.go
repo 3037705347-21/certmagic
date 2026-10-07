@@ -253,6 +253,22 @@ func (keys KeyBuilder) SiteMeta(issuerKey, domain string) string {
 	return path.Join(keys.CertsSitePrefix(issuerKey, domain), safeDomain+".json")
 }
 
+// RevocationsPrefix returns the storage key prefix under
+// which certificate revocation ledger records for the
+// given issuer are kept.
+func (keys KeyBuilder) RevocationsPrefix(issuerKey string) string {
+	return path.Join(prefixRevocations, keys.Safe(issuerKey))
+}
+
+// Revocation returns the storage key for the revocation
+// ledger record of the certificate with the given stable
+// identity (see revocationCertID) for the given issuer.
+// There is exactly one record per certificate, so repeated
+// revocations never produce duplicate records.
+func (keys KeyBuilder) Revocation(issuerKey, certID string) string {
+	return path.Join(keys.RevocationsPrefix(issuerKey), certID+".json")
+}
+
 // OCSPStaple returns a key for the OCSP staple associated
 // with the given certificate. If you have the PEM bundle
 // handy, pass that in to save an extra encoding step.
@@ -357,8 +373,9 @@ var locksMu sync.Mutex
 var StorageKeys KeyBuilder
 
 const (
-	prefixCerts = "certificates"
-	prefixOCSP  = "ocsp"
+	prefixCerts       = "certificates"
+	prefixOCSP        = "ocsp"
+	prefixRevocations = "revocations"
 )
 
 // safeKeyRE matches any undesirable characters in storage keys.

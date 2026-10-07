@@ -65,6 +65,11 @@ func (certCache *Cache) maintainAssets(panicCount int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Finish any revocation that was recorded but not completed before
+	// this process exited (or by another instance that went away). The
+	// renewal tick below keeps reconciling so failures are retried.
+	certCache.reconcileRevocations(ctx)
+
 	for {
 		select {
 		case <-renewalTicker.C:
@@ -72,6 +77,7 @@ func (certCache *Cache) maintainAssets(panicCount int) {
 			if err != nil {
 				log.Error("renewing managed certificates", zap.Error(err))
 			}
+			certCache.reconcileRevocations(ctx)
 		case <-ocspTicker.C:
 			certCache.updateOCSPStaples(ctx)
 		case <-certCache.stopChan:
